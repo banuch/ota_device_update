@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OTA Console</title>
+<style>
+  :root {
+    --bg: #f6f7f9; --panel: #fff; --text: #1b1f24; --muted: #616a75; --line: #dde1e6;
+    --accent: #1f6feb; --ok: #1a7f37; --warn: #9a6700; --bad: #cf222e; --chip: #eef1f4;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0f1216; --panel: #171b21; --text: #e6e9ed; --muted: #95a0ac; --line: #2a3038;
+            --accent: #4c8dff; --ok: #3fb950; --warn: #d29922; --bad: #f85149; --chip: #222831; }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  header { display: flex; flex-wrap: wrap; gap: 12px; align-items: center; justify-content: space-between;
+           padding: 14px 16px; border-bottom: 1px solid var(--line); background: var(--panel); }
+  header h1 { margin: 0; font-size: 17px; }
+  main { max-width: 1200px; margin: 0 auto; padding: 16px; display: grid; gap: 16px; }
+  section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 14px 16px; }
+  h2 { margin: 0 0 10px; font-size: 15px; }
+  .row { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+  input, select, button { font: inherit; color: var(--text); background: var(--bg);
+           border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+  button { cursor: pointer; background: var(--chip); }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.danger { color: var(--bad); }
+  .scroll { overflow-x: auto; }
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-weight: 600; font-size: 12px; }
+  td.mono, .mono { font-family: ui-monospace, Consolas, monospace; font-size: 12.5px; }
+  .muted { color: var(--muted); }
+  .st-running { color: var(--ok); } .st-failed, .st-md5_fail { color: var(--bad); }
+  .st-downloading, .st-flashed { color: var(--warn); }
+  #msg { min-height: 1.4em; }
+  #msg.err { color: var(--bad); } #msg.ok { color: var(--ok); }
+  .grid2 { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+</style>
+</head>
+<body>
+<header>
+  <h1>OTA Console</h1>
+  <div class="row">
+    <input id="token" type="password" placeholder="Admin token" autocomplete="off" style="width:200px">
+    <button id="saveToken" class="primary">Connect</button>
+    <button id="refresh">Refresh</button>
+  </div>
+</header>
+<main>
+  <div id="msg"></div>
+
+  <div class="grid2">
+    <section>
+      <h2>Channels</h2>
+      <div id="channels" class="row"></div>
+      <p class="muted">Devices without a pinned version follow their channel. Channels only upgrade.</p>
+    </section>
+    <section>
+      <h2>Upload release</h2>
+      <form id="uploadForm" class="row">
+        <input name="version" placeholder="1.2.3" required pattern="\d+\.\d+\.\d+" style="width:90px">
+        <input name="notes" placeholder="Notes" style="flex:1;min-width:120px">
+        <input name="file" type="file" accept=".bin" required>
+        <button class="primary">Upload</button>
+      </form>
+    </section>
+  </div>
+
+  <section>
+    <h2>Releases</h2>
+    <div class="scroll"><table id="releases"><thead><tr>
+      <th>Version</th><th>Size</th><th>MD5</th><th>Notes</th><th>Uploaded</th><th></th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>Devices</h2>
+    <form id="addDevice" class="row" style="margin-bottom:10px">
+      <input name="imei" placeholder="IMEI (15 digits)" required pattern="\d{14,17}" style="width:170px">
+      <input name="label" placeholder="Label" style="width:160px">
+      <button>Pre-register</button>
+    </form>
+    <div class="scroll"><table id="devices"><thead><tr>
+      <th>IMEI</th><th>Label</th><th>Running</th><th>Status</th><th>Last seen</th>
+      <th>Channel</th><th>Pinned</th><th>Interval (s)</th><th>Enabled</th><th></th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+
+  <section>
+    <h2>History <span id="evFilter" class="muted"></span></h2>
+    <div class="scroll"><table id="events"><thead><tr>
+      <th>Time</th><th>IMEI</th><th>Event</th><th>Version</th><th>Detail</th>
+    </tr></thead><tbody></tbody></table></div>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
