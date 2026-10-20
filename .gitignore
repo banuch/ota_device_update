@@ -3,3 +3,4 @@ server/data/
 server/.env
 firmware/**/build/
 *.log
+firmware/release/

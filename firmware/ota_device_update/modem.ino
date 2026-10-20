@@ -135,8 +135,15 @@ bool modem_init() {
 }
 
 // ── Network clock (AT+CCLK?) ────────────────────────────────────────────────
-// Reply: +CCLK: "yy/MM/dd,hh:mm:ss±zz"  (local time, zz = quarter hours)
+// Reply: +CCLK: "yy/MM/dd,hh:mm:ss±zz"  (zz = network offset, quarter hours)
 // Returns UTC epoch seconds, or 0 if the module has not synced yet.
+//
+// The EC200U reports hh:mm:ss ALREADY IN UTC; ±zz is the network's local
+// offset, informational only. Field-confirmed twice: dlms_client (2026-08,
+// modem 17:09:18 vs NTP UTC 17:10:54) and here (2026-10-20, modem 14:42:01
+// vs UTC 14:42:33, "+22"). Subtracting zz made every signature 5.5 h stale
+// (server: timestamp_out_of_window). If a different module/firmware ever
+// reports local time instead, set MODEM_CCLK_IS_UTC to 0 in config.h.
 static long modem_daysFromCivil(int y, int m, int d) {
     y -= m <= 2;
     const long era = (y >= 0 ? y : y - 399) / 400;
@@ -154,8 +161,15 @@ uint32_t modem_epochSeconds() {
     if (sscanf(r.c_str() + qi + 8, "%d/%d/%d,%d:%d:%d%d", &yy, &MM, &dd, &hh, &mi, &ss, &tzq) < 6) return 0;
     if (yy < 24 || yy > 99) return 0;   // power-on default (2002/1970) -> not synced
     long days = modem_daysFromCivil(2000 + yy, MM, dd);
-    long local = days * 86400L + hh * 3600L + mi * 60L + ss;
-    return (uint32_t)(local - (long)tzq * 15L * 60L);
+    long clock = days * 86400L + hh * 3600L + mi * 60L + ss;
+#if MODEM_CCLK_IS_UTC
+    long utc = clock;
+#else
+    long utc = clock - (long)tzq * 15L * 60L;
+#endif
+    DEBUG_SERIAL.printf("[MDM] clock %02d-%02d-%02d %02d:%02d:%02d tz=%+d -> epoch %ld (UTC)\n",
+                        yy, MM, dd, hh, mi, ss, tzq, utc);
+    return (uint32_t)utc;
 }
 
 // ── TCP ─────────────────────────────────────────────────────────────────────

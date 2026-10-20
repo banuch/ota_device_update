@@ -10,7 +10,7 @@
 #include <Arduino.h>
 
 // ── Firmware identity ───────────────────────────────────────────────────────
-#define FW_VERSION            "1.0.0"     // MAJOR.MINOR.PATCH -- bump before each release
+#define FW_VERSION            "1.0.3"     // MAJOR.MINOR.PATCH -- bump before each release
 
 // ── Debug console ───────────────────────────────────────────────────────────
 #define DEBUG_SERIAL          Serial
@@ -28,6 +28,9 @@
 #define MODEM_RX_BUFFER       4096
 #define MODEM_QUIET_WINDOW_MS 1500UL
 #define OTA_CONNECT_ID        0           // QIOPEN connect id used for all OTA traffic
+// EC200U AT+CCLK? returns UTC time plus an informational tz field (see
+// modem_epochSeconds()). 0 = treat the time as local and subtract tz.
+#define MODEM_CCLK_IS_UTC     1
 
 // ── Server / timing defaults (NVS overrides) ────────────────────────────────
 #define OTA_HOST_DEFAULT      "65.20.77.137"
