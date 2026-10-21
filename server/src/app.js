@@ -26,7 +26,7 @@ function createApp(cfg) {
     const urlPath = req.originalUrl.split('?')[0]; // never log the download token
     res.on('finish', () => {
       if (urlPath.startsWith('/ota/') && !process.env.OTA_QUIET) {
-        console.log(`${new Date().toISOString()} ${req.socket.remoteAddress} ${req.method} ` +
+        console.log(`${new Date().toISOString()} ${req.ip} ${req.method} ` +
           `${urlPath} ${res.statusCode} ${Date.now() - t0}ms`);
       }
     });

@@ -7,8 +7,9 @@
 // Prompts for the password (hidden). For scripts, pipe it in:
 //   echo "the-password" | npm run user:add -- ops --role viewer
 //
-// --reset  existing user: set the new password and role, re-enable the
-//          account, and end all of its sessions.
+// --reset  existing user: set the new password (and --role, if given; the
+//          current role is kept otherwise), re-enable the account, and end
+//          all of its sessions.
 // Safe to run while the server is up (SQLite WAL).
 const readline = require('readline');
 const { loadConfig } = require('../src/config');
@@ -16,7 +17,7 @@ const { openDb } = require('../src/db');
 const { hashPassword, validatePassword, validateUsername } = require('../src/auth');
 
 function parseArgs(argv) {
-  const out = { role: 'viewer', reset: false, username: null };
+  const out = { role: null, reset: false, username: null };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === '--role') out.role = argv[++i];
@@ -47,13 +48,15 @@ async function main() {
   if (!args.username) return fail('usage: npm run user:add -- <username> [--role admin|viewer] [--reset]');
   const uErr = validateUsername(args.username);
   if (uErr) return fail(uErr);
-  if (!['admin', 'viewer'].includes(args.role)) return fail('--role must be admin or viewer');
+  if (args.role !== null && !['admin', 'viewer'].includes(args.role)) return fail('--role must be admin or viewer');
 
   const cfg = loadConfig();
   require('fs').mkdirSync(cfg.dataDir, { recursive: true });
   const store = openDb(cfg.dbFile);
   const existing = store.getUserByName(args.username);
   if (existing && !args.reset) return fail(`user '${existing.username}' exists (use --reset to set a new password)`);
+  // New users default to viewer; a reset keeps the current role unless --role is given.
+  const role = args.role || (existing ? existing.role : 'viewer');
 
   const pw = await ask(`Password for ${args.username}: `, true);
   const pErr = validatePassword(pw);
@@ -64,14 +67,14 @@ async function main() {
   }
 
   if (existing) {
-    store.updateUser(existing.id, { passHash: hashPassword(pw), role: args.role, enabled: 1 });
+    store.updateUser(existing.id, { passHash: hashPassword(pw), role, enabled: 1 });
     store.deleteUserSessions(existing.id, '');
-    store.logEvent('-', 'user_updated', null, `${existing.username}: reset via CLI (${args.role})`, 'cli');
-    console.log(`Reset '${existing.username}' (${args.role}); its sessions were ended.`);
+    store.logEvent('-', 'user_updated', null, `${existing.username}: reset via CLI (${role})`, 'cli');
+    console.log(`Reset '${existing.username}' (${role}); its sessions were ended.`);
   } else {
-    store.addUser({ username: args.username, passHash: hashPassword(pw), role: args.role });
-    store.logEvent('-', 'user_added', null, `${args.username} (${args.role}) via CLI`, 'cli');
-    console.log(`Created ${args.role} '${args.username}'.`);
+    store.addUser({ username: args.username, passHash: hashPassword(pw), role });
+    store.logEvent('-', 'user_added', null, `${args.username} (${role}) via CLI`, 'cli');
+    console.log(`Created ${role} '${args.username}'.`);
   }
   store.close();
 }

@@ -57,7 +57,7 @@ function deviceRoutes({ store, cfg, replayGuard }) {
       store.logEvent(imei, 'registered', currentVer);
       device = store.getDevice(imei);
     }
-    store.touchDevice(imei, currentVer, req.socket.remoteAddress);
+    store.touchDevice(imei, currentVer, req.ip);
     const interval = device.check_interval_s || cfg.defaultIntervalSec;
 
     const noUpdate = (reason) =>

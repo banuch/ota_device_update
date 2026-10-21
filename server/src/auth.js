@@ -7,8 +7,9 @@
 //  Sessions    random 32-byte cookie value "ota_sid"; the DB stores only its
 //              sha256. HttpOnly + SameSite=Strict (+ Secure over HTTPS).
 //              Ends after SESSION_IDLE_SEC of inactivity or SESSION_MAX_SEC.
-//  Lockout     LOGIN_MAX_FAILS failed logins for a username within
-//              LOGIN_LOCK_SEC lock it for LOGIN_LOCK_SEC.
+//  Lockout     LOGIN_MAX_FAILS failed logins for a username from one IP (or
+//              4x that from one IP for any usernames) within LOGIN_LOCK_SEC
+//              lock it for LOGIN_LOCK_SEC.
 //  CSRF        cookie-authenticated writes must carry "X-OTA-Console: 1"
 //              (a custom header cross-site pages cannot send).
 //  API key     "Authorization: Bearer <ADMIN_TOKEN>" = admin, actor "api-token".
@@ -52,33 +53,59 @@ function validateUsername(name) {
   return USERNAME_RE.test(String(name || '')) ? null : 'username must be 3-32 chars: letters, digits . _ -';
 }
 
+// Failures are counted per (ip, username) and per ip. Keying on the username
+// alone would let anyone lock a real admin out; the per-ip budget stops one
+// source from spraying passwords across many usernames.
+const IP_FAIL_FACTOR = 4;
+const LIMITER_MAX_KEYS = 10000;
+
 class LoginLimiter {
   constructor({ maxFails, lockSec, clock }) {
     this.maxFails = maxFails;
     this.lockMs = lockSec * 1000;
     this.clock = clock;
-    this.state = new Map(); // username(lower) -> {fails:[ms...], lockedUntil}
+    this.state = new Map(); // key -> {fails:[ms...], lockedUntil}
   }
-  key(u) { return String(u || '').toLowerCase(); }
-  lockedFor(username) {
-    const s = this.state.get(this.key(username));
-    const left = s && s.lockedUntil ? s.lockedUntil - this.clock() : 0;
+  keys(username, ip) {
+    const addr = String(ip || '-');
+    return [[`u:${addr}|${String(username || '').toLowerCase()}`, this.maxFails],
+      [`ip:${addr}`, this.maxFails * IP_FAIL_FACTOR]];
+  }
+  lockedFor(username, ip) {
+    const now = this.clock();
+    let left = 0;
+    for (const [k] of this.keys(username, ip)) {
+      const s = this.state.get(k);
+      if (s && s.lockedUntil > now) left = Math.max(left, s.lockedUntil - now);
+    }
     return left > 0 ? Math.ceil(left / 1000) : 0;
   }
-  fail(username) {
-    const k = this.key(username);
+  fail(username, ip) {
     const now = this.clock();
-    const s = this.state.get(k) || { fails: [], lockedUntil: 0 };
-    s.fails = s.fails.filter((t) => now - t < this.lockMs);
-    s.fails.push(now);
-    if (s.fails.length >= this.maxFails) {
-      s.lockedUntil = now + this.lockMs;
-      s.fails = [];
+    for (const [k, max] of this.keys(username, ip)) {
+      const s = this.state.get(k) || { fails: [], lockedUntil: 0 };
+      s.fails = s.fails.filter((t) => now - t < this.lockMs);
+      s.fails.push(now);
+      if (s.fails.length >= max) {
+        s.lockedUntil = now + this.lockMs;
+        s.fails = [];
+      }
+      this.state.set(k, s);
     }
-    this.state.set(k, s);
-    return s.lockedUntil > now;
+    if (this.state.size > LIMITER_MAX_KEYS) this.prune(now);
+    return this.lockedFor(username, ip) > 0;
   }
-  success(username) { this.state.delete(this.key(username)); }
+  success(username, ip) { this.state.delete(this.keys(username, ip)[0][0]); }
+  /** Drops expired entries; if still near the cap, the oldest ones (with headroom so this stays rare). */
+  prune(now) {
+    for (const [k, s] of this.state) {
+      if (s.lockedUntil <= now && s.fails.every((t) => now - t >= this.lockMs)) this.state.delete(k);
+    }
+    for (const k of this.state.keys()) {
+      if (this.state.size <= LIMITER_MAX_KEYS * 0.9) break;
+      this.state.delete(k);
+    }
+  }
 }
 
 function parseCookies(header) {
@@ -86,7 +113,9 @@ function parseCookies(header) {
   for (const part of String(header || '').split(';')) {
     const eq = part.indexOf('=');
     if (eq === -1) continue;
-    out[part.slice(0, eq).trim()] = decodeURIComponent(part.slice(eq + 1).trim());
+    const raw = part.slice(eq + 1).trim();
+    // Other apps on the same host can set cookies we cannot decode; keep them raw.
+    try { out[part.slice(0, eq).trim()] = decodeURIComponent(raw); } catch { out[part.slice(0, eq).trim()] = raw; }
   }
   return out;
 }
@@ -105,7 +134,7 @@ function createAuth({ store, cfg }) {
   function startSession(req, res, user) {
     const token = crypto.randomBytes(32).toString('base64url');
     store.purgeSessions(cfg.sessionIdleSec, cfg.sessionMaxSec);
-    store.createSession(sha256(token), user.id, req.socket.remoteAddress, req.get('user-agent'));
+    store.createSession(sha256(token), user.id, req.ip, req.get('user-agent'));
     store.setLastLogin(user.id);
     res.setHeader('Set-Cookie', `${COOKIE}=${token}; ${cookieAttrs(req, cfg.sessionMaxSec)}`);
   }

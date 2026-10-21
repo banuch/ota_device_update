@@ -37,7 +37,7 @@ function userRoutes({ store, auth }) {
     if (store.getUserByName(username)) return bad(res, 'username already exists', 409);
     const id = store.addUser({ username, passHash: hashPassword(password), role });
     store.logEvent('-', 'user_added', null, `${username} (${role})`, actorName(req));
-    res.status(201).json(store.listUsers().find((u) => u.id === Number(id)));
+    res.status(201).json(store.getPublicUser(Number(id)));
   });
 
   r.patch('/:id', (req, res) => {
@@ -69,7 +69,7 @@ function userRoutes({ store, auth }) {
       fields.passHash = hashPassword(b.password);
       notes.push('password reset');
     }
-    if (!Object.keys(fields).length) return res.json(store.listUsers().find((u) => u.id === user.id));
+    if (!Object.keys(fields).length) return res.json(store.getPublicUser(user.id));
 
     const losesAdmin = user.role === 'admin' && user.enabled &&
       (fields.role === 'viewer' || fields.enabled === 0);
@@ -80,7 +80,7 @@ function userRoutes({ store, auth }) {
       store.deleteUserSessions(user.id, isSelf(req, user) ? req.sessionId || '' : '');
     }
     store.logEvent('-', 'user_updated', null, `${user.username}: ${notes.join(', ')}`, actorName(req));
-    res.json(store.listUsers().find((u) => u.id === user.id));
+    res.json(store.getPublicUser(user.id));
   });
 
   r.delete('/:id', (req, res) => {

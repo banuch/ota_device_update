@@ -24,6 +24,15 @@ function loadDotEnv(file) {
   }
 }
 
+/** Express wants a boolean or hop count as such; any other string is an IP/subnet list. */
+function parseTrustProxy(v) {
+  const s = String(v || '').trim();
+  if (!s || s.toLowerCase() === 'false') return '';
+  if (s.toLowerCase() === 'true') return true;
+  if (/^\d+$/.test(s)) return Number(s);
+  return s;
+}
+
 function loadConfig(overrides = {}) {
   loadDotEnv(path.join(__dirname, '..', '.env'));
   const dataDir = overrides.dataDir || process.env.DATA_DIR || path.join(__dirname, '..', 'data');
@@ -47,7 +56,7 @@ function loadConfig(overrides = {}) {
     // auto = Secure flag only when the request arrived over HTTPS; always / never
     cookieSecure: (process.env.COOKIE_SECURE || 'auto').toLowerCase(),
     // e.g. "loopback" when running behind nginx on the same host
-    trustProxy: process.env.TRUST_PROXY || '',
+    trustProxy: parseTrustProxy(process.env.TRUST_PROXY),
     clock: Date.now,
     ...overrides,
   };
@@ -64,4 +73,4 @@ function assertConfig(cfg) {
   }
 }
 
-module.exports = { loadConfig, assertConfig };
+module.exports = { loadConfig, assertConfig, parseTrustProxy };

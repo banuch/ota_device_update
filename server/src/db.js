@@ -140,6 +140,7 @@ function openDb(file, opts = {}) {
     listUsers: db.prepare(`SELECT id, username, role, enabled, created_at, last_login FROM users
                            ORDER BY username`),
     getUser: db.prepare('SELECT * FROM users WHERE id = ?'),
+    getPublicUser: db.prepare('SELECT id, username, role, enabled, created_at, last_login FROM users WHERE id = ?'),
     getUserByName: db.prepare('SELECT * FROM users WHERE username = ?'),
     insertUser: db.prepare(`INSERT INTO users(username, pass_hash, role, created_at)
                             VALUES (@username, @pass_hash, @role, @created_at)`),
@@ -226,6 +227,8 @@ function openDb(file, opts = {}) {
 
     listUsers: () => q.listUsers.all(),
     getUser: (id) => q.getUser.get(id) || null,
+    /** A user without pass_hash, safe to return from the API. */
+    getPublicUser: (id) => q.getPublicUser.get(id) || null,
     getUserByName: (name) => q.getUserByName.get(name) || null,
     addUser: ({ username, passHash, role }) =>
       q.insertUser.run({ username, pass_hash: passHash, role, created_at: now() }).lastInsertRowid,

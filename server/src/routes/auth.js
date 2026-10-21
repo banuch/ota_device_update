@@ -26,23 +26,23 @@ function authRoutes({ store, auth }) {
   r.post('/login', (req, res) => {
     const username = String((req.body && req.body.username) || '').trim();
     const password = String((req.body && req.body.password) || '');
-    const locked = auth.limiter.lockedFor(username);
+    const locked = auth.limiter.lockedFor(username, req.ip);
     if (locked) return res.status(429).json({ error: 'locked', retry_after_s: locked });
 
     const user = username ? store.getUserByName(username) : null;
     // Always run scrypt so response time does not reveal whether the user exists.
     const ok = verifyPassword(password, user ? user.pass_hash : DUMMY_HASH) && user && user.enabled;
     if (!ok) {
-      const nowLocked = auth.limiter.fail(username);
-      store.logEvent('-', 'login_failed', null, `user '${username.slice(0, 32)}' from ${req.socket.remoteAddress}`,
-        username.slice(0, 32) || '-');
+      const nowLocked = auth.limiter.fail(username, req.ip);
+      // actor stays '-': the typed username is unauthenticated input, not who acted.
+      store.logEvent('-', 'login_failed', null, `user '${username.slice(0, 32)}' from ${req.ip}`, '-');
       return res.status(nowLocked ? 429 : 401).json(nowLocked
-        ? { error: 'locked', retry_after_s: auth.limiter.lockedFor(username) }
+        ? { error: 'locked', retry_after_s: auth.limiter.lockedFor(username, req.ip) }
         : { error: 'invalid_credentials' });
     }
-    auth.limiter.success(username);
+    auth.limiter.success(username, req.ip);
     auth.startSession(req, res, user);
-    store.logEvent('-', 'login', null, `from ${req.socket.remoteAddress}`, user.username);
+    store.logEvent('-', 'login', null, `from ${req.ip}`, user.username);
     res.json({ username: user.username, role: user.role });
   });
 

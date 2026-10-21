@@ -9,18 +9,21 @@ const path = require('path');
 const Database = require('better-sqlite3');
 const { loadConfig } = require('../src/config');
 const { createApp } = require('../src/app');
-const { hashPassword, verifyPassword } = require('../src/auth');
+const { execFileSync } = require('child_process');
+const { hashPassword, verifyPassword, parseCookies, LoginLimiter } = require('../src/auth');
+const { parseTrustProxy } = require('../src/config');
+const { openDb } = require('../src/db');
 const { deviceKey, sign } = require('../src/hmac');
 
 const ADMIN_TOKEN = 'admin-token-for-tests';
 const MASTER = 'master-secret-for-tests';
 const PW = 'correct-horse-battery';
 
-async function setup(t, { preCreateDb } = {}) {
+async function setup(t, { preCreateDb, cfg: extra = {} } = {}) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ota-auth-'));
   if (preCreateDb) preCreateDb(path.join(dataDir, 'ota.db'));
   const clock = { now: Date.now() };
-  const cfg = loadConfig({ dataDir, masterSecret: MASTER, adminToken: ADMIN_TOKEN, clock: () => clock.now });
+  const cfg = loadConfig({ dataDir, masterSecret: MASTER, adminToken: ADMIN_TOKEN, clock: () => clock.now, ...extra });
   cfg.dbFile = path.join(dataDir, 'ota.db');
   cfg.firmwareDir = path.join(dataDir, 'firmware');
   const { app, store } = createApp(cfg);
@@ -34,8 +37,9 @@ async function setup(t, { preCreateDb } = {}) {
   // Minimal cookie-jar browser.
   const browser = () => {
     let cookie = '';
-    const call = async (method, p, body, { csrf = true } = {}) => {
+    const call = async (method, p, body, { csrf = true, ip } = {}) => {
       const headers = {};
+      if (ip) headers['X-Forwarded-For'] = ip;
       if (cookie) headers.Cookie = cookie;
       if (csrf) headers['X-OTA-Console'] = '1';
       if (body !== undefined) headers['Content-Type'] = 'application/json';
@@ -44,7 +48,8 @@ async function setup(t, { preCreateDb } = {}) {
       if (sc) cookie = sc.split(';')[0].endsWith('=') ? '' : sc.split(';')[0];
       return { status: res.status, body: await res.json().catch(() => null), setCookie: sc };
     };
-    return { call, login: (u, pw = PW) => call('POST', '/auth/login', { username: u, password: pw }), cookie: () => cookie };
+    return { call, login: (u, pw = PW, opts) => call('POST', '/auth/login', { username: u, password: pw }, opts),
+      cookie: () => cookie };
   };
   const api = async (method, p, body) => {
     const res = await fetch(base + p, { method,
@@ -277,4 +282,66 @@ test('old database without events.actor is migrated in place', async (t) => {
   const ev = store.listEvents({ imei: '868000000000001' });
   assert.strictEqual(ev[0].detail, 'old');
   assert.strictEqual(ev[0].actor, 'device');
+});
+
+test('undecodable cookies from other apps do not break requests', async (t) => {
+  const { base } = await setup(t);
+  const res = await fetch(base + '/auth/me', { headers: { Cookie: 'other=%E0%A4%A; ota_sid=x' } });
+  assert.strictEqual(res.status, 401);
+  assert.deepStrictEqual(parseCookies('a=%zz; b=%20'), { a: '%zz', b: ' ' });
+});
+
+test('lockout is per source IP; one IP cannot spray many usernames', async (t) => {
+  const { browser, store } = await setup(t, { cfg: { trustProxy: 'loopback' } });
+  const b = browser();
+  for (let i = 0; i < 5; i++) await b.login('boss', 'wrong-password', { ip: '203.0.113.9' });
+  assert.strictEqual((await b.login('boss', PW, { ip: '203.0.113.9' })).status, 429);
+  assert.strictEqual((await b.login('boss', PW, { ip: '198.51.100.7' })).status, 200, 'other IP unaffected');
+
+  const failed = store.listEvents({ type: 'login_failed' });
+  assert.ok(failed.every((e) => e.actor === '-'), 'typed username is not recorded as the actor');
+  assert.match(failed[0].detail, /203\.0\.113\.9/, 'logs the forwarded client IP');
+
+  for (let i = 0; i < 20; i++) await b.login(`user${i}`, 'wrong-password', { ip: '192.0.2.1' });
+  const sprayed = await b.login('watcher', PW, { ip: '192.0.2.1' });
+  assert.strictEqual(sprayed.status, 429, 'IP budget exhausted across usernames');
+});
+
+test('login limiter stays bounded under random usernames', () => {
+  let now = 0;
+  const l = new LoginLimiter({ maxFails: 5, lockSec: 60, clock: () => now });
+  for (let i = 0; i < 30000; i++) { now += 10; l.fail(`u${i}`, `10.0.${i >> 8}.${i & 255}`); }
+  assert.ok(l.state.size <= 10000 + 2, `size ${l.state.size}`);
+});
+
+test('TRUST_PROXY accepts booleans and hop counts', () => {
+  assert.strictEqual(parseTrustProxy('true'), true);
+  assert.strictEqual(parseTrustProxy('2'), 2);
+  assert.strictEqual(parseTrustProxy('false'), '');
+  assert.strictEqual(parseTrustProxy(undefined), '');
+  assert.strictEqual(parseTrustProxy('loopback'), 'loopback');
+});
+
+test('user:add --reset keeps the existing role unless --role is given', () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ota-cli-'));
+  try {
+    const store = openDb(path.join(dataDir, 'ota.db'));
+    store.addUser({ username: 'boss', passHash: hashPassword(PW), role: 'admin' });
+    store.close();
+    const tool = path.join(__dirname, '..', 'tools', 'user-add.js');
+    const run = (...args) => execFileSync(process.execPath, [tool, ...args],
+      { input: 'another-good-password\n', env: { ...process.env, DATA_DIR: dataDir } });
+    run('boss', '--reset');
+    let db = openDb(path.join(dataDir, 'ota.db'));
+    assert.strictEqual(db.getUserByName('boss').role, 'admin');
+    db.close();
+    run('boss', '--reset', '--role', 'viewer');
+    run('newbie');
+    db = openDb(path.join(dataDir, 'ota.db'));
+    assert.strictEqual(db.getUserByName('boss').role, 'viewer');
+    assert.strictEqual(db.getUserByName('newbie').role, 'viewer');
+    db.close();
+  } finally {
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  }
 });

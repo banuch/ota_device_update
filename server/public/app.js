@@ -192,6 +192,9 @@
 
     function draw() {
       const shown = devices.filter(matches);
+      // Bulk actions apply to the selection, so never keep rows the filters hide.
+      const shownIds = new Set(shown.map((d) => d.imei));
+      for (const imei of [...selected]) if (!shownIds.has(imei)) selected.delete(imei);
       $('#count').textContent = shown.length === devices.length ? '' : `${shown.length} of ${devices.length} shown`;
       $('#rows').innerHTML = shown.map((d) => `<tr class="click ${selected.has(d.imei) ? 'selected' : ''}" data-imei="${esc(d.imei)}">
         <td class="admin-only"><input type="checkbox" data-sel="${esc(d.imei)}" ${selected.has(d.imei) ? 'checked' : ''} aria-label="Select"></td>

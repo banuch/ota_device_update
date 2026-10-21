@@ -47,14 +47,20 @@ function adminRoutes({ store, cfg, auth }) {
   const channelExists = (name) => !!store.getChannel(name);
   const actor = (req) => req.actor.username;
 
+  /** Channel name -> version, read once per request instead of once per device. */
+  const channelMap = () => {
+    const m = new Map(store.listChannels().map((c) => [c.name, c.version]));
+    return (name) => m.get(name) || null;
+  };
+
   // Adds computed state the UI filters on.
-  function decorate(d) {
+  function decorate(d, channelVersion = store.channelVersion) {
     const now = store.now();
     const interval = d.check_interval_s || cfg.defaultIntervalSec;
     const online = !!d.last_seen && now - d.last_seen <= interval + ONLINE_GRACE_SEC;
     let target = null;
     let reason = 'never_checked';
-    if (d.current_ver) ({ target, reason } = resolveTarget(d, d.current_ver, store.channelVersion));
+    if (d.current_ver) ({ target, reason } = resolveTarget(d, d.current_ver, channelVersion));
     if (!d.enabled) reason = 'device_disabled';
     return { ...d, online, effective_interval_s: interval, target, target_reason: reason,
       pending: !!(d.enabled && target) };
@@ -87,7 +93,8 @@ function adminRoutes({ store, cfg, auth }) {
 
   // ── overview ────────────────────────────────────────────────────────────
   r.get('/stats', (req, res) => {
-    const devices = store.listDevices().map(decorate);
+    const chv = channelMap();
+    const devices = store.listDevices().map((d) => decorate(d, chv));
     const versions = {};
     for (const d of devices) {
       const v = d.current_ver || 'never checked';
@@ -155,7 +162,10 @@ function adminRoutes({ store, cfg, auth }) {
   });
 
   // ── devices ─────────────────────────────────────────────────────────────
-  r.get('/devices', (req, res) => res.json(store.listDevices().map(decorate)));
+  r.get('/devices', (req, res) => {
+    const chv = channelMap();
+    res.json(store.listDevices().map((d) => decorate(d, chv)));
+  });
 
   r.post('/devices/bulk', (req, res) => {
     const { imeis, set } = req.body || {};
