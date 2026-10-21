@@ -6,7 +6,9 @@
 //  channels  stable / beta -> release version (nullable)
 //  devices   one row per IMEI: channel, optional pin, last seen state
 //  tokens    one-time download tokens (device + release bound, TTL)
-//  events    append-only update history
+//  events    append-only update + audit history (actor = who did it)
+//  users     dashboard accounts (admin / viewer)
+//  sessions  dashboard login sessions (id = sha256 of the cookie value)
 // =============================================================================
 const Database = require('better-sqlite3');
 const crypto = require('crypto');
@@ -54,20 +56,56 @@ CREATE TABLE IF NOT EXISTS events (
   detail      TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS idx_events_imei_ts ON events(imei, ts DESC);
+CREATE TABLE IF NOT EXISTS users (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  username    TEXT NOT NULL UNIQUE COLLATE NOCASE,
+  pass_hash   TEXT NOT NULL,
+  role        TEXT NOT NULL CHECK (role IN ('admin', 'viewer')),
+  enabled     INTEGER NOT NULL DEFAULT 1,
+  created_at  INTEGER NOT NULL,
+  last_login  INTEGER
+);
+CREATE TABLE IF NOT EXISTS sessions (
+  id          TEXT PRIMARY KEY,
+  user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  created_at  INTEGER NOT NULL,
+  last_seen   INTEGER NOT NULL,
+  ip          TEXT,
+  user_agent  TEXT
+);
 INSERT OR IGNORE INTO channels(name, version, updated_at) VALUES ('stable', NULL, 0), ('beta', NULL, 0);
 `;
 
-const now = () => Math.floor(Date.now() / 1000);
+// In-place upgrades for databases created by earlier versions.
+function migrate(db) {
+  const cols = db.prepare('PRAGMA table_info(events)').all().map((c) => c.name);
+  if (!cols.includes('actor')) {
+    db.exec("ALTER TABLE events ADD COLUMN actor TEXT NOT NULL DEFAULT 'device'");
+  }
+  db.exec('CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)');
+}
 
-function openDb(file) {
+/**
+ * @param {string} file
+ * @param {{clock?: () => number}} [opts]  clock returns ms (tests inject a fake one)
+ */
+function openDb(file, opts = {}) {
+  const clock = opts.clock || Date.now;
+  const now = () => Math.floor(clock() / 1000);
+
   const db = new Database(file);
   db.pragma('journal_mode = WAL');
   db.pragma('foreign_keys = ON');
   db.exec(SCHEMA);
+  migrate(db);
 
   const q = {
     // releases
-    listReleases: db.prepare('SELECT * FROM releases ORDER BY created_at DESC'),
+    listReleases: db.prepare(`SELECT r.*,
+        (SELECT GROUP_CONCAT(name) FROM channels c WHERE c.version = r.version) AS channels,
+        (SELECT COUNT(*) FROM devices d WHERE d.pinned_version = r.version) AS pinned_devices,
+        (SELECT COUNT(*) FROM devices d WHERE d.current_ver = r.version) AS running_devices
+      FROM releases r ORDER BY r.created_at DESC`),
     getRelease: db.prepare('SELECT * FROM releases WHERE version = ?'),
     insertRelease: db.prepare(`INSERT INTO releases(version, file, size, md5, notes, created_at)
                                VALUES (@version, @file, @size, @md5, @notes, @created_at)`),
@@ -95,14 +133,36 @@ function openDb(file) {
     useToken: db.prepare('UPDATE tokens SET used_at = ? WHERE token = ? AND used_at IS NULL'),
     purgeTokens: db.prepare('DELETE FROM tokens WHERE expires_at < ?'),
     // events
-    insertEvent: db.prepare('INSERT INTO events(ts, imei, type, version, detail) VALUES (?, ?, ?, ?, ?)'),
-    listEvents: db.prepare('SELECT * FROM events ORDER BY id DESC LIMIT ?'),
-    listEventsFor: db.prepare('SELECT * FROM events WHERE imei = ? ORDER BY id DESC LIMIT ?'),
+    insertEvent: db.prepare('INSERT INTO events(ts, imei, type, version, detail, actor) VALUES (?, ?, ?, ?, ?, ?)'),
+    countFailures: db.prepare(`SELECT COUNT(*) AS events, COUNT(DISTINCT imei) AS devices FROM events
+                               WHERE type IN ('failed', 'md5_fail') AND ts >= ?`),
+    // users
+    listUsers: db.prepare(`SELECT id, username, role, enabled, created_at, last_login FROM users
+                           ORDER BY username`),
+    getUser: db.prepare('SELECT * FROM users WHERE id = ?'),
+    getUserByName: db.prepare('SELECT * FROM users WHERE username = ?'),
+    insertUser: db.prepare(`INSERT INTO users(username, pass_hash, role, created_at)
+                            VALUES (@username, @pass_hash, @role, @created_at)`),
+    deleteUser: db.prepare('DELETE FROM users WHERE id = ?'),
+    countAdmins: db.prepare("SELECT COUNT(*) AS n FROM users WHERE role = 'admin' AND enabled = 1"),
+    countUsers: db.prepare('SELECT COUNT(*) AS n FROM users'),
+    setLastLogin: db.prepare('UPDATE users SET last_login = ? WHERE id = ?'),
+    // sessions
+    insertSession: db.prepare(`INSERT INTO sessions(id, user_id, created_at, last_seen, ip, user_agent)
+                               VALUES (?, ?, ?, ?, ?, ?)`),
+    getSession: db.prepare(`SELECT s.*, u.username, u.role, u.enabled FROM sessions s
+                            JOIN users u ON u.id = s.user_id WHERE s.id = ?`),
+    touchSession: db.prepare('UPDATE sessions SET last_seen = ? WHERE id = ?'),
+    deleteSession: db.prepare('DELETE FROM sessions WHERE id = ?'),
+    deleteUserSessions: db.prepare('DELETE FROM sessions WHERE user_id = ? AND id != ?'),
+    purgeSessions: db.prepare('DELETE FROM sessions WHERE last_seen < ? OR created_at < ?'),
   };
 
   const store = {
     raw: db,
+    now,
     close: () => db.close(),
+    transaction: (fn) => db.transaction(fn)(),
 
     listReleases: () => q.listReleases.all(),
     getRelease: (v) => q.getRelease.get(v) || null,
@@ -148,10 +208,47 @@ function openDb(file) {
       return { row };
     },
 
-    logEvent: (imei, type, version = null, detail = '') =>
-      q.insertEvent.run(now(), imei, type, version, String(detail).slice(0, 500)),
-    listEvents: (imei, limit = 200) =>
-      imei ? q.listEventsFor.all(imei, limit) : q.listEvents.all(limit),
+    logEvent: (imei, type, version = null, detail = '', actor = 'device') =>
+      q.insertEvent.run(now(), imei, type, version, String(detail).slice(0, 500), actor),
+    /** Filtered, paged history (newest first). beforeId pages backwards. */
+    listEvents: ({ imei, type, actor, beforeId, limit = 200 } = {}) => {
+      const where = [];
+      const args = {};
+      if (imei) { where.push('imei = @imei'); args.imei = imei; }
+      if (type) { where.push('type = @type'); args.type = type; }
+      if (actor) { where.push('actor = @actor'); args.actor = actor; }
+      if (beforeId) { where.push('id < @beforeId'); args.beforeId = beforeId; }
+      const sql = `SELECT * FROM events ${where.length ? 'WHERE ' + where.join(' AND ') : ''}
+                   ORDER BY id DESC LIMIT ${Math.max(1, Math.min(Number(limit) || 200, 1000))}`;
+      return db.prepare(sql).all(args);
+    },
+    failuresSince: (ts) => q.countFailures.get(ts),
+
+    listUsers: () => q.listUsers.all(),
+    getUser: (id) => q.getUser.get(id) || null,
+    getUserByName: (name) => q.getUserByName.get(name) || null,
+    addUser: ({ username, passHash, role }) =>
+      q.insertUser.run({ username, pass_hash: passHash, role, created_at: now() }).lastInsertRowid,
+    updateUser: (id, fields) => {
+      const map = { role: 'role', enabled: 'enabled', passHash: 'pass_hash' };
+      const keys = Object.keys(fields).filter((k) => map[k]);
+      if (!keys.length) return false;
+      const sql = `UPDATE users SET ${keys.map((k) => `${map[k]} = @${k}`).join(', ')} WHERE id = @id`;
+      return db.prepare(sql).run({ ...fields, id }).changes > 0;
+    },
+    deleteUser: (id) => q.deleteUser.run(id).changes > 0,
+    countEnabledAdmins: () => q.countAdmins.get().n,
+    countUsers: () => q.countUsers.get().n,
+    setLastLogin: (id) => q.setLastLogin.run(now(), id),
+
+    createSession: (id, userId, ip, ua) =>
+      q.insertSession.run(id, userId, now(), now(), ip || null, String(ua || '').slice(0, 200)),
+    getSession: (id) => q.getSession.get(id) || null,
+    touchSession: (id) => q.touchSession.run(now(), id),
+    deleteSession: (id) => q.deleteSession.run(id),
+    /** Remove all of a user's sessions except keepId (pass '' to remove all). */
+    deleteUserSessions: (userId, keepId = '') => q.deleteUserSessions.run(userId, keepId),
+    purgeSessions: (idleSec, maxSec) => q.purgeSessions.run(now() - idleSec, now() - maxSec),
   };
   return store;
 }

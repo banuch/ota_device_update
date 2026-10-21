@@ -15,6 +15,10 @@ const server = app.listen(cfg.port, () => {
   console.log(`[OTA] server listening on :${cfg.port}`);
   console.log(`[OTA] data dir: ${cfg.dataDir}`);
   console.log(`[OTA] admin dashboard: http://localhost:${cfg.port}/`);
+  if (store.countUsers() === 0) {
+    console.warn('[OTA] WARNING: no dashboard users yet. Create the first admin with:');
+    console.warn('[OTA]   npm run user:add -- <username> --role admin');
+  }
 });
 // Cellular links are slow: give a full firmware download plenty of time.
 server.setTimeout(15 * 60 * 1000);

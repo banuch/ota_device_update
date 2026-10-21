@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>OTA Console · Sign in</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div class="login-wrap">
+  <div class="card login-card">
+    <div class="brand" style="padding:0;color:var(--text)"><span class="dot"></span> OTA Console</div>
+    <p class="muted" style="margin:6px 0 0">Sign in to manage firmware releases and devices.</p>
+    <form id="form" autocomplete="on">
+      <div id="err" class="alert hidden" role="alert"></div>
+      <label class="field">Username
+        <input name="username" autocomplete="username" required autofocus>
+      </label>
+      <label class="field">Password
+        <input name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <button class="primary" id="btn">Sign in</button>
+    </form>
+  </div>
+</div>
+<script>
+(() => {
+  const form = document.getElementById('form');
+  const err = document.getElementById('err');
+  const btn = document.getElementById('btn');
+  // Already signed in? Go straight to the dashboard.
+  fetch('auth/me').then((r) => { if (r.ok) location.replace('./'); });
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    err.classList.add('hidden');
+    btn.disabled = true;
+    btn.textContent = 'Signing in…';
+    const f = new FormData(form);
+    try {
+      const res = await fetch('auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-OTA-Console': '1' },
+        body: JSON.stringify({ username: f.get('username'), password: f.get('password') }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) return location.replace('./');
+      if (data.error === 'locked') {
+        err.textContent = `Too many failed attempts. Try again in ${Math.ceil(data.retry_after_s / 60)} min.`;
+      } else {
+        err.textContent = 'Wrong username or password.';
+      }
+      err.classList.remove('hidden');
+      form.password.value = '';
+      form.password.focus();
+    } catch (_) {
+      err.textContent = 'Server not reachable.';
+      err.classList.remove('hidden');
+    } finally {
+      btn.disabled = false;
+      btn.textContent = 'Sign in';
+    }
+  });
+})();
+</script>
+</body>
+</html>

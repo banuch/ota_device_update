@@ -6,7 +6,8 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node --test",
-    "key": "node tools/device-key.js"
+    "key": "node tools/device-key.js",
+    "user:add": "node tools/user-add.js"
   },
   "type": "commonjs",
   "dependencies": {

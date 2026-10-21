@@ -39,6 +39,16 @@ function loadConfig(overrides = {}) {
     defaultIntervalSec: Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 86400),
     autoRegister: (process.env.AUTO_REGISTER || 'true').toLowerCase() !== 'false',
     maxFirmwareBytes: Number(process.env.MAX_FIRMWARE_BYTES || 8 * 1024 * 1024),
+    // Dashboard login
+    sessionIdleSec: Number(process.env.SESSION_IDLE_SEC || 8 * 3600),
+    sessionMaxSec: Number(process.env.SESSION_MAX_SEC || 24 * 3600),
+    loginMaxFails: Number(process.env.LOGIN_MAX_FAILS || 5),
+    loginLockSec: Number(process.env.LOGIN_LOCK_SEC || 15 * 60),
+    // auto = Secure flag only when the request arrived over HTTPS; always / never
+    cookieSecure: (process.env.COOKIE_SECURE || 'auto').toLowerCase(),
+    // e.g. "loopback" when running behind nginx on the same host
+    trustProxy: process.env.TRUST_PROXY || '',
+    clock: Date.now,
     ...overrides,
   };
   return cfg;
