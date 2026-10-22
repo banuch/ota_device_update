@@ -10,7 +10,7 @@
 #include <Arduino.h>
 
 // ── Firmware identity ───────────────────────────────────────────────────────
-#define FW_VERSION            "1.0.3"     // MAJOR.MINOR.PATCH -- bump before each release
+#define FW_VERSION            "1.1.0"     // MAJOR.MINOR.PATCH -- bump before each release
 
 // ── Debug console ───────────────────────────────────────────────────────────
 #define DEBUG_SERIAL          Serial
@@ -41,6 +41,13 @@
 #define CHECK_RETRY_S             900UL    // after a failed check / download
 #define BOOT_CHECK_DELAY_MS       5000UL   // after the modem attaches
 
+// ── Automatic registration (register.ino) ───────────────────────────────────
+// The OTA server's registration public key. Get this line from the server:
+//   cd server && npm run pubkey
+// Empty = automatic registration off; provision with SET secret=... instead.
+#define SERVER_REG_PUBKEY_HEX     ""
+#define REGISTER_POLL_S           600UL    // while waiting for approval (server may say otherwise)
+
 // ── Transfer limits ─────────────────────────────────────────────────────────
 #define OTA_CHUNK_SIZE        1024        // AT+QIRD request size
 #define HTTP_JSON_MAX         2048        // largest JSON reply we accept
@@ -55,6 +62,7 @@
 #define K_INTERVAL            "interval"
 #define K_APN                 "apn"
 #define K_PENDING_VER         "pend_ver"   // set before reboot into a new image
+#define K_REG_KEY             "reg_key"    // registration key pair (32 priv + 65 pub), until a key arrives
 
 // ── BLE command service (Nordic UART style) ─────────────────────────────────
 #define ENABLE_BLE            1

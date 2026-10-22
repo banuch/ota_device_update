@@ -24,6 +24,17 @@ function loadDotEnv(file) {
   }
 }
 
+/**
+ * REGISTRATION_MODE: approval (default) | auto | off.
+ * Older .env files may still have AUTO_REGISTER=false, which means off.
+ */
+function parseRegistrationMode(mode, autoRegister) {
+  const m = String(mode || '').trim().toLowerCase();
+  if (['approval', 'auto', 'off'].includes(m)) return m;
+  if (m) throw new Error(`REGISTRATION_MODE must be approval, auto or off (got '${mode}')`);
+  return String(autoRegister || '').toLowerCase() === 'false' ? 'off' : 'approval';
+}
+
 /** Express wants a boolean or hop count as such; any other string is an IP/subnet list. */
 function parseTrustProxy(v) {
   const s = String(v || '').trim();
@@ -46,7 +57,11 @@ function loadConfig(overrides = {}) {
     tsWindowSec: Number(process.env.TS_WINDOW_SEC || 300),
     tokenTtlSec: Number(process.env.TOKEN_TTL_SEC || 600),
     defaultIntervalSec: Number(process.env.DEFAULT_CHECK_INTERVAL_SEC || 86400),
-    autoRegister: (process.env.AUTO_REGISTER || 'true').toLowerCase() !== 'false',
+    // Automatic registration (POST /ota/register) -- see regkey.js
+    registrationMode: parseRegistrationMode(process.env.REGISTRATION_MODE, process.env.AUTO_REGISTER),
+    registerMaxPending: Number(process.env.REGISTER_MAX_PENDING || 500),
+    registerPollSec: Number(process.env.REGISTER_POLL_SEC || 600),
+    regKeyFile: path.join(dataDir, 'server_reg_key.pem'),
     maxFirmwareBytes: Number(process.env.MAX_FIRMWARE_BYTES || 8 * 1024 * 1024),
     // Dashboard login
     sessionIdleSec: Number(process.env.SESSION_IDLE_SEC || 8 * 3600),
@@ -60,6 +75,9 @@ function loadConfig(overrides = {}) {
     clock: Date.now,
     ...overrides,
   };
+  // A signed /ota/check from an unknown IMEI (manually provisioned key)
+  // creates the device unless registration is off.
+  if (!('autoRegister' in overrides)) cfg.autoRegister = cfg.registrationMode !== 'off';
   return cfg;
 }
 
@@ -73,4 +91,4 @@ function assertConfig(cfg) {
   }
 }
 
-module.exports = { loadConfig, assertConfig, parseTrustProxy };
+module.exports = { loadConfig, assertConfig, parseTrustProxy, parseRegistrationMode };

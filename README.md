@@ -15,8 +15,56 @@ server/                       Express + better-sqlite3 OTA server, admin API, da
 2. Otherwise → the current release of its channel (`stable` / `beta`), upgrades only.
 3. Target == running version → no update.
 
-New devices auto-register on `stable` at their first check (`AUTO_REGISTER=false` to
-allow only pre-registered IMEIs).
+New devices register themselves by IMEI and wait for an admin to approve them in the
+dashboard (see [Automatic registration](#automatic-registration)). They join `stable`.
+
+## Automatic registration
+
+A device without a key gets one from the server automatically. You don't need to type
+`SET secret=` on it.
+
+1. At boot the device reads its IMEI (`AT+GSN`), makes a P-256 key pair (kept in NVS
+   until it has a key) and sends `POST /ota/register {device_id, current_ver, pub}`.
+2. It appears under **Devices → Awaiting approval**, and the Overview shows a banner. It
+   asks again every 10 min (`REGISTER_POLL_SEC`).
+3. An admin opens the device and clicks **Approve** (bulk approve works too). Before
+   approving, check that the **key fingerprint** matches `GET_STATUS` on the device
+   (`reg=pending fp=xxxxxxxx`), or that you trust where the request came from.
+4. On its next request the device receives its key, encrypted with
+   `AES-256-GCM(SHA256(ECDH(device, server) ‖ IMEI))`. It saves the key and starts
+   normal checks.
+
+| `REGISTRATION_MODE` | Behaviour |
+|---|---|
+| `approval` (default) | new devices wait for an admin |
+| `auto` | approved immediately (lab or factory use only) |
+| `off` | `/ota/register` refused; only manually provisioned keys work |
+
+The old `AUTO_REGISTER=false` still means `off`.
+
+**Setup:** the firmware must contain the server's registration public key. Run this on
+the OTA server:
+
+```bash
+cd server && npm run pubkey
+```
+
+Paste the printed `#define SERVER_REG_PUBKEY_HEX "04…"` line into `firmware/…/config.h`
+and build. The private key is `server/data/server_reg_key.pem`, created on first start.
+**Back it up.** Without it, firmware built with the old public key can no longer register.
+Devices that already have a key keep working.
+
+Security notes:
+
+- The device key never crosses the network in clear. A reply decrypts only on the device
+  that made the request, and only if it came from the real server.
+- If a device that is already approved sends a *different* key (its NVS was erased, or
+  someone is spoofing its IMEI), it shows up as awaiting approval with a "new key"
+  warning. The working device is not locked out in the meantime.
+- **Reject** blocks a new device. Delete it to let it ask again.
+- At most `REGISTER_MAX_PENDING` (500) devices can wait at once, and each IMEI can ask at
+  most once every 20 s.
+- Manual `SET secret=` still works as a fallback, as before.
 
 ## Protocol
 
@@ -26,6 +74,7 @@ allow only pre-registered IMEIs).
 | reply `{update_available, version, size, md5, download_token, check_interval_s, reason, sig}` | `imei\|ts\|version\|size\|md5\|download_token` (verified by the device) |
 | `GET /ota/firmware?device_id=&token=` | one-time token, 10 min, bound to device + release |
 | `POST /ota/report` `{device_id, version, status, detail, ts, sig}` | `imei\|version\|status\|ts` |
+| `POST /ota/register` `{device_id, current_ver, pub}` → `{status:"pending", retry_s}` or `{status:"approved", iv, ct, tag}` | unsigned; the key in the reply is encrypted for `pub` (see above) |
 
 - **Device key** = `HMAC_SHA256(MASTER_SECRET, IMEI)` as 64 lowercase hex chars; the device
   uses that hex string's ASCII bytes as its HMAC key. The server stores no per-device keys.
@@ -102,8 +151,11 @@ version string.
 
 ### Commissioning (USB serial, 115200)
 
+With automatic registration nothing is needed beyond approving the device in the
+dashboard. To provision manually instead:
+
 ```
-GET_STATUS                              # shows the IMEI
+GET_STATUS                              # shows the IMEI and reg=<state> fp=<fingerprint>
 SET host=65.20.77.137 port=8080 secret=<64-hex device key>
 CHECK_OTA
 ```

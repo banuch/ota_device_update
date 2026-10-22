@@ -14,6 +14,13 @@
 //                                              never chunked)
 //    POST /ota/report    {device_id, version, status, detail, ts, sig}
 //         -> {ok:true}
+//    POST /ota/register  {device_id, current_ver, pub}      (unsigned)
+//         -> {status:"pending", retry_s}
+//          | {status:"approved", iv, ct, tag}   device key, encrypted for pub
+//         403 registration_rejected / registration_off,
+//         429 too_frequent, 503 registration_queue_full
+//         pub = device's P-256 public key (130 hex). The admin approves that
+//         exact key in the dashboard; see regkey.js for the encryption.
 //
 //  Responses are flat JSON with Content-Length (the firmware's HTTP parser
 //  does not support chunked transfer encoding).
@@ -23,10 +30,32 @@ const fs = require('fs');
 const path = require('path');
 const { verifyRequest, deviceKey, sign } = require('../hmac');
 const { resolveTarget } = require('../resolver');
+const { isValidPub, pubFingerprint } = require('../regkey');
 
 const REPORT_STATUSES = new Set(['downloading', 'flashed', 'md5_fail', 'failed', 'running']);
+const IMEI_RE = /^\d{14,17}$/;
+const REGISTER_MIN_GAP_MS = 20 * 1000;
 
-function deviceRoutes({ store, cfg, replayGuard }) {
+// One /ota/register per IMEI per REGISTER_MIN_GAP_MS. Per IMEI, not per IP:
+// many cellular devices share one carrier NAT address.
+class RegisterThrottle {
+  constructor(gapMs) {
+    this.gapMs = gapMs;
+    this.last = new Map();
+  }
+  allow(imei) {
+    const now = Date.now();
+    if (this.last.size > 5000) {
+      for (const [k, t] of this.last) if (now - t >= this.gapMs) this.last.delete(k);
+    }
+    const t = this.last.get(imei);
+    if (t && now - t < this.gapMs) return false;
+    this.last.set(imei, now);
+    return true;
+  }
+}
+
+function deviceRoutes({ store, cfg, replayGuard, regKey }) {
   const r = express.Router();
   r.use(express.json({ limit: '4kb' }));
 
@@ -56,6 +85,9 @@ function deviceRoutes({ store, cfg, replayGuard }) {
       store.addDevice({ imei });
       store.logEvent(imei, 'registered', currentVer);
       device = store.getDevice(imei);
+    }
+    if (device.reg_state !== 'approved') {
+      return fail(res, 403, device.reg_state === 'rejected' ? 'registration_rejected' : 'awaiting_approval');
     }
     store.touchDevice(imei, currentVer, req.ip);
     const interval = device.check_interval_s || cfg.defaultIntervalSec;
@@ -88,6 +120,54 @@ function deviceRoutes({ store, cfg, replayGuard }) {
       reason,
       sig: offerSig,
     });
+  });
+
+  const throttle = new RegisterThrottle(cfg.registerGapMs ?? REGISTER_MIN_GAP_MS);
+
+  r.post('/register', (req, res) => {
+    const b = req.body || {};
+    const imei = String(b.device_id || '');
+    const currentVer = String(b.current_ver || '').slice(0, 32);
+    const pub = String(b.pub || '').toLowerCase();
+    if (!IMEI_RE.test(imei)) return fail(res, 400, 'bad_device_id');
+    if (!isValidPub(pub)) return fail(res, 400, 'bad_pub');
+    if (cfg.registrationMode === 'off') return fail(res, 403, 'registration_off');
+    if (!throttle.allow(imei)) return fail(res, 429, 'too_frequent');
+    const auto = cfg.registrationMode === 'auto';
+    const fp = pubFingerprint(pub);
+
+    let device = store.getDevice(imei);
+    if (!device) {
+      if (!auto && store.countPendingRegistrations() >= cfg.registerMaxPending) {
+        return fail(res, 503, 'registration_queue_full');
+      }
+      store.addDevice({ imei, regState: auto ? 'approved' : 'pending' });
+      device = store.getDevice(imei);
+    }
+    if (device.reg_pub !== pub) {
+      if (device.reg_pub) {
+        store.logEvent(imei, 'registration_key_changed', currentVer,
+          `${pubFingerprint(device.reg_pub)} -> ${fp}`);
+      } else {
+        store.logEvent(imei, 'registration_requested', currentVer, `key ${fp}`);
+      }
+      store.setRegPub(imei, pub);
+    }
+    store.touchDevice(imei, currentVer, req.ip);
+    if (device.reg_state === 'rejected') return fail(res, 403, 'registration_rejected');
+
+    if (auto && device.reg_approved_pub !== pub) {
+      store.setRegState(imei, 'approved', pub);
+      store.logEvent(imei, 'registration_approved', currentVer, `key ${fp}`, 'auto');
+    }
+    device = store.getDevice(imei);
+    if (device.reg_state === 'approved' && device.reg_approved_pub === pub) {
+      const wrapped = regKey.wrapDeviceKey(pub, imei, deviceKey(cfg.masterSecret, imei));
+      if (!wrapped) return fail(res, 400, 'bad_pub');
+      store.logEvent(imei, 'key_delivered', currentVer, `key ${fp}`);
+      return res.json({ status: 'approved', ...wrapped });
+    }
+    return res.json({ status: 'pending', retry_s: cfg.registerPollSec });
   });
 
   r.get('/firmware', (req, res) => {

@@ -4,7 +4,8 @@
 //
 //  releases  one row per uploaded firmware image
 //  channels  stable / beta -> release version (nullable)
-//  devices   one row per IMEI: channel, optional pin, last seen state
+//  devices   one row per IMEI: channel, optional pin, last seen state,
+//            registration state (approved / pending / rejected) + device ECDH pub
 //  tokens    one-time download tokens (device + release bound, TTL)
 //  events    append-only update + audit history (actor = who did it)
 //  users     dashboard accounts (admin / viewer)
@@ -38,7 +39,11 @@ CREATE TABLE IF NOT EXISTS devices (
   last_status       TEXT,
   last_seen         INTEGER,
   last_ip           TEXT,
-  created_at        INTEGER NOT NULL
+  created_at        INTEGER NOT NULL,
+  reg_state         TEXT NOT NULL DEFAULT 'approved',
+  reg_pub           TEXT,
+  reg_approved_pub  TEXT,
+  reg_requested_at  INTEGER
 );
 CREATE TABLE IF NOT EXISTS tokens (
   token       TEXT PRIMARY KEY,
@@ -83,6 +88,16 @@ function migrate(db) {
     db.exec("ALTER TABLE events ADD COLUMN actor TEXT NOT NULL DEFAULT 'device'");
   }
   db.exec('CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts DESC)');
+  const devCols = db.prepare('PRAGMA table_info(devices)').all().map((c) => c.name);
+  const add = {
+    reg_state: "TEXT NOT NULL DEFAULT 'approved'",
+    reg_pub: 'TEXT',
+    reg_approved_pub: 'TEXT',
+    reg_requested_at: 'INTEGER',
+  };
+  for (const [col, def] of Object.entries(add)) {
+    if (!devCols.includes(col)) db.exec(`ALTER TABLE devices ADD COLUMN ${col} ${def}`);
+  }
 }
 
 /**
@@ -120,8 +135,12 @@ function openDb(file, opts = {}) {
     // devices
     listDevices: db.prepare('SELECT * FROM devices ORDER BY COALESCE(last_seen, 0) DESC, imei'),
     getDevice: db.prepare('SELECT * FROM devices WHERE imei = ?'),
-    insertDevice: db.prepare(`INSERT INTO devices(imei, label, channel, created_at)
-                              VALUES (@imei, @label, @channel, @created_at)`),
+    insertDevice: db.prepare(`INSERT INTO devices(imei, label, channel, created_at, reg_state)
+                              VALUES (@imei, @label, @channel, @created_at, @reg_state)`),
+    setRegPub: db.prepare('UPDATE devices SET reg_pub = ?, reg_requested_at = ? WHERE imei = ?'),
+    setRegState: db.prepare(`UPDATE devices SET reg_state = @state,
+                             reg_approved_pub = COALESCE(@approved_pub, reg_approved_pub) WHERE imei = @imei`),
+    countPendingReg: db.prepare("SELECT COUNT(*) AS n FROM devices WHERE reg_state = 'pending'"),
     deleteDevice: db.prepare('DELETE FROM devices WHERE imei = ?'),
     touchDevice: db.prepare(`UPDATE devices SET current_ver = @current_ver, last_seen = @ts,
                              last_ip = @ip WHERE imei = @imei`),
@@ -178,8 +197,14 @@ function openDb(file, opts = {}) {
 
     listDevices: () => q.listDevices.all(),
     getDevice: (imei) => q.getDevice.get(imei) || null,
-    addDevice: ({ imei, label = '', channel = 'stable' }) =>
-      q.insertDevice.run({ imei, label, channel, created_at: now() }),
+    addDevice: ({ imei, label = '', channel = 'stable', regState = 'approved' }) =>
+      q.insertDevice.run({ imei, label, channel, created_at: now(), reg_state: regState }),
+    /** Remember the ECDH public key a device sent to /ota/register. */
+    setRegPub: (imei, pub) => q.setRegPub.run(pub, now(), imei),
+    /** state: approved / pending / rejected; approvedPub = pub cleared for key delivery. */
+    setRegState: (imei, state, approvedPub = null) =>
+      q.setRegState.run({ imei, state, approved_pub: approvedPub }).changes > 0,
+    countPendingRegistrations: () => q.countPendingReg.get().n,
     deleteDevice: (imei) => q.deleteDevice.run(imei).changes > 0,
     touchDevice: (imei, currentVer, ip) =>
       q.touchDevice.run({ imei, current_ver: currentVer, ip: ip || null, ts: now() }),
