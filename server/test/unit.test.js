@@ -47,3 +47,35 @@ test('verifyRequest accepts a valid signature once, rejects replay/skew/tamper',
   const other = sign(deviceKey(master, '868123456789099'), surface);
   assert.strictEqual(verifyRequest({ ...base, sig: other }).error, 'bad_signature');
 });
+
+test('REGISTRATION_MODE parsing and legacy AUTO_REGISTER', () => {
+  const { parseRegistrationMode } = require('../src/config');
+  assert.strictEqual(parseRegistrationMode('', ''), 'approval');
+  assert.strictEqual(parseRegistrationMode('AUTO', ''), 'auto');
+  assert.strictEqual(parseRegistrationMode('off', 'true'), 'off');
+  assert.strictEqual(parseRegistrationMode('', 'false'), 'off');
+  assert.throws(() => parseRegistrationMode('yes', ''));
+});
+
+test('old devices table migrates with registration columns', () => {
+  const Database = require('better-sqlite3');
+  const fs = require('fs');
+  const os = require('os');
+  const path = require('path');
+  const { openDb } = require('../src/db');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ota-mig-'));
+  const file = path.join(dir, 'ota.db');
+  const old = new Database(file);
+  old.exec(`CREATE TABLE devices (imei TEXT PRIMARY KEY, label TEXT NOT NULL DEFAULT '',
+    channel TEXT NOT NULL DEFAULT 'stable', pinned_version TEXT, check_interval_s INTEGER,
+    enabled INTEGER NOT NULL DEFAULT 1, current_ver TEXT, last_status TEXT, last_seen INTEGER,
+    last_ip TEXT, created_at INTEGER NOT NULL);
+    INSERT INTO devices(imei, created_at) VALUES ('868123456789012', 1);`);
+  old.close();
+  const store = openDb(file);
+  const d = store.getDevice('868123456789012');
+  assert.strictEqual(d.reg_state, 'approved');
+  assert.strictEqual(d.reg_pub, null);
+  store.close();
+  fs.rmSync(dir, { recursive: true, force: true });
+});

@@ -18,6 +18,9 @@
 //    POST   /api/devices/bulk     {imeis:[...], set:{channel|pinned_version|enabled|check_interval_s}}
 //    DELETE /api/devices/:imei
 //    GET    /api/devices/:imei/key            provisioning key (admin only)
+//    POST   /api/devices/:imei/approve        approve the device's registration key
+//    POST   /api/devices/:imei/reject         refuse a pending registration
+//    GET    /api/registration                 mode + server public key (for config.h)
 //    GET    /api/events?imei=&type=&actor=&before=&limit=
 // =============================================================================
 const express = require('express');
@@ -27,13 +30,14 @@ const fs = require('fs');
 const path = require('path');
 const { deviceKey } = require('../hmac');
 const { isValidVersion, resolveTarget } = require('../resolver');
+const { pubFingerprint } = require('../regkey');
 
 const IMEI_RE = /^\d{14,17}$/;
 const ESP_IMAGE_MAGIC = 0xe9;
 const ONLINE_GRACE_SEC = 15 * 60;
 const BULK_MAX = 1000;
 
-function adminRoutes({ store, cfg, auth }) {
+function adminRoutes({ store, cfg, auth, regKey }) {
   const r = express.Router();
   const upload = multer({
     storage: multer.memoryStorage(),
@@ -62,8 +66,16 @@ function adminRoutes({ store, cfg, auth }) {
     let reason = 'never_checked';
     if (d.current_ver) ({ target, reason } = resolveTarget(d, d.current_ver, channelVersion));
     if (!d.enabled) reason = 'device_disabled';
-    return { ...d, online, effective_interval_s: interval, target, target_reason: reason,
-      pending: !!(d.enabled && target) };
+    // Waiting for an admin: a new device, or a known one that sent a new key
+    // (e.g. NVS erased) that has not been approved yet.
+    const awaiting = d.reg_state === 'pending' ||
+      (d.reg_state === 'approved' && !!d.reg_pub && d.reg_pub !== d.reg_approved_pub);
+    const { reg_pub, reg_approved_pub, ...rest } = d;
+    return { ...rest, online, effective_interval_s: interval, target, target_reason: reason,
+      pending: !!(d.enabled && target && d.reg_state === 'approved'),
+      awaiting_approval: awaiting,
+      reg_fingerprint: pubFingerprint(reg_pub),
+      reg_key_changed: awaiting && !!reg_approved_pub };
   }
 
   /** Validates a device field patch. Returns {fields} or {error}. */
@@ -106,6 +118,8 @@ function adminRoutes({ store, cfg, auth }) {
       online: devices.filter((d) => d.online).length,
       disabled: devices.filter((d) => !d.enabled).length,
       pending: devices.filter((d) => d.pending).length,
+      awaiting_approval: devices.filter((d) => d.awaiting_approval).length,
+      registration_mode: cfg.registrationMode,
       failed_24h: { events: fails.events, devices: fails.devices },
       versions: Object.entries(versions).map(([version, count]) => ({ version, count }))
         .sort((a, b) => b.count - a.count),
@@ -224,6 +238,33 @@ function adminRoutes({ store, cfg, auth }) {
     if (!IMEI_RE.test(req.params.imei)) return bad(res, 'imei must be 14-17 digits');
     store.logEvent(req.params.imei, 'key_viewed', null, '', actor(req));
     res.json({ imei: req.params.imei, device_key: deviceKey(cfg.masterSecret, req.params.imei) });
+  });
+
+  // ── registration ────────────────────────────────────────────────────────
+  r.post('/devices/:imei/approve', auth.requireAdmin, (req, res) => {
+    const dev = store.getDevice(req.params.imei);
+    if (!dev) return bad(res, 'not found', 404);
+    if (!dev.reg_pub) return bad(res, 'device has not requested registration yet', 409);
+    const fp = req.body && req.body.fingerprint;
+    if (fp && String(fp).toLowerCase() !== pubFingerprint(dev.reg_pub)) {
+      return bad(res, 'fingerprint does not match the key the device sent', 409);
+    }
+    store.setRegState(dev.imei, 'approved', dev.reg_pub);
+    store.logEvent(dev.imei, 'registration_approved', null, `key ${pubFingerprint(dev.reg_pub)}`, actor(req));
+    res.json(decorate(store.getDevice(dev.imei)));
+  });
+
+  r.post('/devices/:imei/reject', auth.requireAdmin, (req, res) => {
+    const dev = store.getDevice(req.params.imei);
+    if (!dev) return bad(res, 'not found', 404);
+    if (dev.reg_state !== 'pending') return bad(res, 'only a pending registration can be rejected', 409);
+    store.setRegState(dev.imei, 'rejected');
+    store.logEvent(dev.imei, 'registration_rejected', null, `key ${pubFingerprint(dev.reg_pub)}`, actor(req));
+    res.json(decorate(store.getDevice(dev.imei)));
+  });
+
+  r.get('/registration', (req, res) => {
+    res.json({ mode: cfg.registrationMode, server_pubkey: regKey.publicKeyHex() });
   });
 
   // ── events ──────────────────────────────────────────────────────────────

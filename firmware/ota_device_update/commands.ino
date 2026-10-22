@@ -2,7 +2,7 @@
 //  commands.ino  --  text commands, shared by Serial and BLE
 //
 //    HELP
-//    GET_STATUS
+//    GET_STATUS                      also shows reg=<state> fp=<key fingerprint>
 //    CHECK_OTA                       queue an immediate check (runs in loop())
 //    SET key=value [key=value ...]   keys: host port secret interval apn
 //    REBOOT
@@ -22,6 +22,7 @@ static void cmd_status(Print& out) {
     out.printf("server=%s:%u key=%s interval=%lus apn=%s\n", g_cfg.host.c_str(), g_cfg.port,
                g_cfg.secret.length() == 64 ? "set" : "MISSING", (unsigned long)g_cfg.intervalS,
                g_cfg.apn.c_str());
+    out.printf("%s\n", reg_statusLine().c_str());
     out.printf("modem=%s busy=%d partition=%s\n", g_ota.modemReady ? "ready" : "down", g_ota.busy,
                run ? run->label : "?");
     out.printf("last=%s offer=%s next_check_in=%lds\n", g_ota.lastResult.c_str(),

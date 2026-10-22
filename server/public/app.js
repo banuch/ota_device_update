@@ -43,9 +43,12 @@
   const STATUS_CLASS = { running: 'ok', flashed: 'warn', downloading: 'warn', failed: 'bad', md5_fail: 'bad' };
   const statusChip = (s) => (s ? `<span class="chip ${STATUS_CLASS[s] || ''}">${esc(s)}</span>` : '<span class="muted">—</span>');
   const EVENT_CLASS = { ...STATUS_CLASS, offered: 'info', denied: 'bad', login_failed: 'bad', error: 'bad',
-    download_aborted: 'bad', download_sent: 'ok', registered: 'info' };
+    download_aborted: 'bad', download_sent: 'ok', registered: 'info', registration_requested: 'warn',
+    registration_key_changed: 'warn', registration_approved: 'ok', registration_rejected: 'bad', key_delivered: 'ok' };
   const eventChip = (t) => `<span class="chip ${EVENT_CLASS[t] || ''}">${esc(t)}</span>`;
   function targetCell(d) {
+    if (d.reg_state === 'rejected') return '<span class="chip bad">rejected</span>';
+    if (d.awaiting_approval) return '<span class="chip warn">awaiting approval</span>';
     if (!d.enabled) return '<span class="chip">disabled</span>';
     if (d.pending) return `<span class="chip warn">→ ${esc(d.target)}</span>`;
     if (d.target_reason === 'never_checked') return '<span class="muted">never checked</span>';
@@ -89,6 +92,9 @@
     view.innerHTML = `
       <div class="page-head"><div><h1>Overview</h1><div class="sub">Fleet state right now</div></div>
         <button class="ghost" id="refresh">Refresh</button></div>
+      ${s.awaiting_approval ? `<div class="alert warn" style="margin-bottom:16px">
+        <strong>${s.awaiting_approval}</strong> device(s) waiting for registration approval.
+        <a href="#/devices" id="goAwaiting">Review →</a></div>` : ''}
       <div class="grid cols-4">
         <div class="card stat"><div class="label">Devices</div><div class="value">${s.devices}</div>
           <div class="hint">${s.disabled} disabled</div></div>
@@ -119,6 +125,8 @@
       <div class="card" style="margin-top:16px"><div class="row"><h2>Recent activity</h2><span class="spacer"></span>
         <a href="#/history">All history →</a></div>${eventsTable(s.recent)}</div>`;
     view.querySelector('#refresh').onclick = render;
+    const goAwaiting = view.querySelector('#goAwaiting');
+    if (goAwaiting) goAwaiting.onclick = () => { devFilter.state = 'awaiting'; };
     view.querySelectorAll('[data-channel]').forEach((sel) => {
       sel.onchange = run(async () => {
         await api('PUT', `api/channels/${sel.dataset.channel}`, { version: sel.value || null });
@@ -148,7 +156,8 @@
         <div class="toolbar">
           <input type="search" id="q" placeholder="Search IMEI or label…" value="${esc(devFilter.q)}">
           <select id="fChannel"><option value="">All channels</option><option>stable</option><option>beta</option></select>
-          <select id="fState"><option value="">Any state</option><option value="online">Online</option>
+          <select id="fState"><option value="">Any state</option><option value="awaiting">Awaiting approval</option>
+            <option value="online">Online</option>
             <option value="offline">Offline</option><option value="pending">Update pending</option>
             <option value="failed">Last update failed</option><option value="pinned">Pinned</option>
             <option value="disabled">Disabled</option></select>
@@ -161,6 +170,7 @@
           <select id="bPin"><option value="">Pin version…</option><option value="__none">Unpin (follow channel)</option>
             ${releases.map((r) => `<option>${esc(r.version)}</option>`).join('')}</select>
           <button id="bEnable">Enable</button><button id="bDisable" class="danger">Disable</button>
+          <button id="bApprove" class="primary">Approve registration</button>
           <span class="spacer"></span><button class="ghost" id="bClear">Clear selection</button>
         </div>
         <div class="table-wrap"><table><thead><tr>
@@ -180,6 +190,7 @@
       if (devFilter.channel && d.channel !== devFilter.channel) return false;
       if (devFilter.version && d.current_ver !== devFilter.version) return false;
       switch (devFilter.state) {
+        case 'awaiting': return d.awaiting_approval;
         case 'online': return d.online;
         case 'offline': return !d.online;
         case 'pending': return d.pending;
@@ -204,7 +215,7 @@
         <td>${statusChip(d.last_status)}</td><td title="${esc(fmtTime(d.last_seen))}">${fmtAgo(d.last_seen)}</td>
         <td>${esc(d.channel)}</td><td class="mono">${esc(d.pinned_version || '')}</td></tr>`).join('')
         || `<tr><td colspan="10" class="empty">${devices.length ? 'No devices match the filters.'
-          : 'No devices yet. Devices appear after their first check, or add one above.'}</td></tr>`;
+          : 'No devices yet. Devices appear when they ask to register, or add one above.'}</td></tr>`;
       const allBox = $('#all');
       allBox.checked = shown.length > 0 && shown.every((d) => selected.has(d.imei));
       allBox.onchange = () => { shown.forEach((d) => (allBox.checked ? selected.add(d.imei) : selected.delete(d.imei))); draw(); };
@@ -241,6 +252,16 @@
     $('#bEnable').onclick = () => bulk({ enabled: true }, 'Enable');
     $('#bDisable').onclick = () => bulk({ enabled: false }, 'Disable updates');
     $('#bClear').onclick = () => { selected.clear(); draw(); };
+    $('#bApprove').onclick = run(async () => {
+      const todo = devices.filter((d) => selected.has(d.imei) && d.awaiting_approval);
+      if (!todo.length) throw new Error('None of the selected devices is waiting for approval');
+      if (!confirm(`Approve registration of ${todo.length} device(s)? Each receives its device key on its next request.\n\n` +
+        todo.map((d) => `${d.imei}  key ${d.reg_fingerprint}`).join('\n'))) return;
+      for (const d of todo) await api('POST', `api/devices/${d.imei}/approve`, { fingerprint: d.reg_fingerprint });
+      toast(`${todo.length} device(s) approved`);
+      selected.clear();
+      render();
+    });
 
     $('#addDev').onsubmit = run(async (e) => {
       e.preventDefault();
@@ -266,6 +287,7 @@
         <div class="sub">${esc(d.label) || 'No label'}</div></div>
         <div class="row"><span class="chip ${d.online ? 'ok' : ''}"><span class="dot ${d.online ? 'on' : ''}"></span>
           ${d.online ? 'online' : 'offline'}</span>${targetCell(d)}</div></div>
+      ${registrationCard(d)}
       <div class="grid cols-2">
         <div class="card"><h2>Status</h2><dl class="kv">
           <dt>Running</dt><dd class="mono">${esc(d.current_ver || '—')}</dd>
@@ -312,6 +334,21 @@
       toast('Saved');
       render();
     });
+    const approve = view.querySelector('#regApprove');
+    if (approve) approve.onclick = run(async () => {
+      if (!confirm(`Approve ${d.imei}?\n\nOnly approve if the device shows key fingerprint ${d.reg_fingerprint} ` +
+        '(GET_STATUS over USB or BLE) or you trust where this request came from.')) return;
+      await api('POST', `api/devices/${d.imei}/approve`, { fingerprint: d.reg_fingerprint });
+      toast('Approved — the device gets its key on its next request');
+      render();
+    });
+    const reject = view.querySelector('#regReject');
+    if (reject) reject.onclick = run(async () => {
+      if (!confirm(`Reject ${d.imei}? It will not get a key. Delete the device later to let it ask again.`)) return;
+      await api('POST', `api/devices/${d.imei}/reject`);
+      toast('Registration rejected');
+      render();
+    });
     view.querySelector('#showKey').onclick = run(async () => {
       const r = await api('GET', `api/devices/${d.imei}/key`);
       const cmd = `SET secret=${r.device_key}`;
@@ -324,11 +361,26 @@
         () => toast('Copy failed — select the text instead', true));
     });
     view.querySelector('#delDev').onclick = run(async () => {
-      if (!confirm(`Delete ${d.imei}? It re-registers on its next check unless auto-register is off.`)) return;
+      if (!confirm(`Delete ${d.imei}? It can ask to register again unless registration is off.`)) return;
       await api('DELETE', `api/devices/${d.imei}`);
       toast('Device deleted');
       location.hash = '#/devices';
     });
+  }
+
+  function registrationCard(d) {
+    if (!d.awaiting_approval && d.reg_state !== 'rejected') return '';
+    const what = d.reg_state === 'rejected' ? 'Registration was rejected. Delete the device to let it ask again.'
+      : d.reg_key_changed ? 'This device sent a <strong>new</strong> registration key (e.g. its memory was erased). ' +
+        'It keeps working with its current key; approve only if you expected this.'
+        : 'This device asked to register. Approving sends it its device key, encrypted for the key below.';
+    return `<div class="card" style="margin-bottom:16px"><h2>Registration</h2>
+      <div class="alert ${d.reg_state === 'rejected' ? '' : 'warn'}">${what}</div>
+      <div class="row" style="margin-top:10px"><span>Key fingerprint</span>
+        <code class="mono">${esc(d.reg_fingerprint || '—')}</code>
+        <span class="muted">compare with GET_STATUS on the device</span><span class="spacer"></span>
+        ${d.awaiting_approval ? `<span class="admin-only row"><button class="primary" id="regApprove">Approve</button>
+          ${d.reg_state === 'pending' ? '<button class="danger" id="regReject">Reject</button>' : ''}</span>` : ''}</div></div>`;
   }
 
   // ── Releases ────────────────────────────────────────────────────────────
@@ -394,7 +446,8 @@
 
   // ── History ─────────────────────────────────────────────────────────────
   const histFilter = { imei: '', type: '', actor: '' };
-  const EVENT_TYPES = ['registered', 'offered', 'download_start', 'download_sent', 'download_aborted', 'denied',
+  const EVENT_TYPES = ['registration_requested', 'registration_key_changed', 'registration_approved',
+    'registration_rejected', 'key_delivered', 'registered', 'offered', 'download_start', 'download_sent', 'download_aborted', 'denied',
     'downloading', 'flashed', 'running', 'failed', 'md5_fail', 'error', 'admin_update', 'channel_set',
     'release_uploaded', 'release_deleted', 'device_deleted', 'key_viewed', 'login', 'login_failed', 'logout',
     'user_added', 'user_updated', 'user_deleted', 'password_changed'];

@@ -210,3 +210,176 @@ test('device requests with a wrong key or stale timestamp are rejected', async (
   const bad = await fetch(base + '/ota/check', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{nope' });
   assert.strictEqual(bad.status, 400);
 });
+
+// ── Automatic registration ──────────────────────────────────────────────────
+// Simulated device side of register.ino: P-256 pair, ECDH with the server's
+// public key, AES-256-GCM decrypt of the delivered key.
+function regDevice(base, imei, serverPubHex) {
+  const ecdh = crypto.createECDH('prime256v1');
+  ecdh.generateKeys();
+  const pub = ecdh.getPublicKey('hex', 'uncompressed');
+  return {
+    pub,
+    fingerprint: crypto.createHash('sha256').update(Buffer.from(pub, 'hex')).digest('hex').slice(0, 8),
+    register: async (overrides = {}) => {
+      const res = await fetch(base + '/ota/register', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_id: imei, current_ver: '1.0.0', pub, ...overrides }),
+      });
+      return { status: res.status, body: await res.json() };
+    },
+    decrypt: (b) => {
+      const z = ecdh.computeSecret(Buffer.from(serverPubHex, 'hex'));
+      const k = crypto.createHash('sha256').update(z).update(imei).digest();
+      const d = crypto.createDecipheriv('aes-256-gcm', k, Buffer.from(b.iv, 'hex'));
+      d.setAAD(Buffer.from(imei));
+      d.setAuthTag(Buffer.from(b.tag, 'hex'));
+      return Buffer.concat([d.update(Buffer.from(b.ct, 'hex')), d.final()]).toString('utf8');
+    },
+  };
+}
+
+async function regSetup(t, overrides = {}) {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ota-reg-'));
+  const cfg = loadConfig({ dataDir, masterSecret: MASTER, adminToken: ADMIN, registerGapMs: 0, ...overrides });
+  const { app, store, regKey } = createApp(cfg);
+  const server = await new Promise((r) => { const s = app.listen(0, () => r(s)); });
+  const base = `http://127.0.0.1:${server.address().port}`;
+  t.after(() => new Promise((r) => server.close(() => { store.close(); fs.rmSync(dataDir, { recursive: true, force: true }); r(); })));
+  const admin = async (method, p, body) => {
+    const res = await fetch(base + p, {
+      method,
+      headers: { Authorization: `Bearer ${ADMIN}`, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  let tsBump = 0; // distinct ts per call so the replay guard sees distinct sigs
+  const signedCheck = async (imei, key) => {
+    const ts = Math.floor(Date.now() / 1000) + (tsBump++ % 50);
+    const res = await fetch(base + '/ota/check', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ device_id: imei, current_ver: '1.0.0', ts, sig: sign(key, `${imei}|1.0.0|${ts}`) }),
+    });
+    return { status: res.status, body: await res.json() };
+  };
+  return { base, admin, signedCheck, serverPub: regKey.publicKeyHex(), dataDir };
+}
+
+test('registration: pending -> admin approves -> device decrypts its key and checks', async (t) => {
+  const { base, admin, signedCheck, serverPub } = await regSetup(t);
+  const dev = regDevice(base, IMEI_A, serverPub);
+
+  let r = await dev.register();
+  assert.strictEqual(r.status, 200);
+  assert.deepStrictEqual(r.body, { status: 'pending', retry_s: 600 });
+  assert.strictEqual((await dev.register()).body.status, 'pending');
+
+  // Waiting device is listed, cannot check yet even with the right key.
+  const d = (await admin('GET', `/api/devices/${IMEI_A}`)).body;
+  assert.strictEqual(d.reg_state, 'pending');
+  assert.strictEqual(d.awaiting_approval, true);
+  assert.strictEqual(d.reg_fingerprint, dev.fingerprint);
+  assert.ok(!('reg_pub' in d));
+  assert.strictEqual((await admin('GET', '/api/stats')).body.awaiting_approval, 1);
+  r = await signedCheck(IMEI_A, deviceKey(MASTER, IMEI_A));
+  assert.strictEqual(r.status, 403);
+  assert.strictEqual(r.body.error, 'awaiting_approval');
+
+  // Fingerprint guard, then approve.
+  assert.strictEqual((await admin('POST', `/api/devices/${IMEI_A}/approve`, { fingerprint: 'deadbeef' })).status, 409);
+  r = await admin('POST', `/api/devices/${IMEI_A}/approve`, { fingerprint: dev.fingerprint });
+  assert.strictEqual(r.status, 200);
+  assert.strictEqual(r.body.awaiting_approval, false);
+
+  r = await dev.register();
+  assert.strictEqual(r.body.status, 'approved');
+  assert.ok(!JSON.stringify(r.body).includes(deviceKey(MASTER, IMEI_A)), 'key must not travel in clear');
+  const key = dev.decrypt(r.body);
+  assert.strictEqual(key, deviceKey(MASTER, IMEI_A));
+  assert.strictEqual((await signedCheck(IMEI_A, key)).status, 200);
+
+  // Another key pair cannot read the reply, and a tampered tag fails.
+  const other = regDevice(base, IMEI_A, serverPub);
+  assert.throws(() => other.decrypt(r.body));
+  assert.throws(() => dev.decrypt({ ...r.body, tag: '00'.repeat(16) }));
+
+  const ev = (await admin('GET', `/api/events?imei=${IMEI_A}`)).body.map((e) => e.type);
+  for (const type of ['registration_requested', 'registration_approved', 'key_delivered']) {
+    assert.ok(ev.includes(type), `missing event ${type}`);
+  }
+});
+
+test('registration: a new key for an approved device needs approval again', async (t) => {
+  const { base, admin, signedCheck, serverPub } = await regSetup(t);
+  const first = regDevice(base, IMEI_A, serverPub);
+  await first.register();
+  await admin('POST', `/api/devices/${IMEI_A}/approve`);
+  assert.strictEqual((await first.register()).body.status, 'approved');
+
+  // Someone (or the same unit after an NVS erase) sends another key.
+  const second = regDevice(base, IMEI_A, serverPub);
+  assert.strictEqual((await second.register()).body.status, 'pending');
+  const d = (await admin('GET', `/api/devices/${IMEI_A}`)).body;
+  assert.strictEqual(d.awaiting_approval, true);
+  assert.strictEqual(d.reg_key_changed, true);
+  // The working device is not locked out meanwhile.
+  assert.strictEqual((await signedCheck(IMEI_A, deviceKey(MASTER, IMEI_A))).status, 200);
+  // A changed key cannot be rejected (that would lock the real device out).
+  assert.strictEqual((await admin('POST', `/api/devices/${IMEI_A}/reject`)).status, 409);
+  await admin('POST', `/api/devices/${IMEI_A}/approve`);
+  assert.strictEqual(second.decrypt((await second.register()).body), deviceKey(MASTER, IMEI_A));
+});
+
+test('registration: reject, input validation, throttle', async (t) => {
+  const { base, admin, signedCheck, serverPub } = await regSetup(t, { registerGapMs: 60_000 });
+  const dev = regDevice(base, IMEI_A, serverPub);
+  await dev.register();
+  assert.strictEqual((await dev.register()).status, 429);
+
+  assert.strictEqual((await admin('POST', `/api/devices/${IMEI_A}/reject`)).status, 200);
+  assert.strictEqual((await signedCheck(IMEI_A, deviceKey(MASTER, IMEI_A))).body.error, 'registration_rejected');
+
+  const b = regDevice(base, IMEI_B, serverPub);
+  assert.strictEqual((await b.register({ device_id: '12ab' })).body.error, 'bad_device_id');
+  assert.strictEqual((await b.register({ pub: '04' + '11'.repeat(64) })).body.error, 'bad_pub');
+  assert.strictEqual((await b.register({ pub: 'zz' })).body.error, 'bad_pub');
+  // A device that never asked cannot be approved.
+  await admin('POST', '/api/devices', { imei: '868123456789036' });
+  assert.strictEqual((await admin('POST', '/api/devices/868123456789036/approve')).status, 409);
+});
+
+test('registration: rejected device stays rejected for new requests', async (t) => {
+  const { base, admin, serverPub } = await regSetup(t);
+  const dev = regDevice(base, IMEI_A, serverPub);
+  await dev.register();
+  await admin('POST', `/api/devices/${IMEI_A}/reject`);
+  const r = await dev.register();
+  assert.strictEqual(r.status, 403);
+  assert.strictEqual(r.body.error, 'registration_rejected');
+  assert.strictEqual((await regDevice(base, IMEI_A, serverPub).register()).status, 403);
+});
+
+test('registration modes: auto approves at once, off refuses, queue cap', async (t) => {
+  const auto = await regSetup(t, { registrationMode: 'auto' });
+  const dev = regDevice(auto.base, IMEI_A, auto.serverPub);
+  const r = await dev.register();
+  assert.strictEqual(r.body.status, 'approved');
+  assert.strictEqual(dev.decrypt(r.body), deviceKey(MASTER, IMEI_A));
+
+  const off = await regSetup(t, { registrationMode: 'off', autoRegister: false });
+  const r2 = await regDevice(off.base, IMEI_A, off.serverPub).register();
+  assert.strictEqual(r2.status, 403);
+  assert.strictEqual(r2.body.error, 'registration_off');
+
+  const capped = await regSetup(t, { registerMaxPending: 1 });
+  assert.strictEqual((await regDevice(capped.base, IMEI_A, capped.serverPub).register()).status, 200);
+  assert.strictEqual((await regDevice(capped.base, IMEI_B, capped.serverPub).register()).status, 503);
+});
+
+test('registration: server key persists across restarts', async (t) => {
+  const { serverPub, dataDir } = await regSetup(t);
+  const { loadRegKey } = require('../src/regkey');
+  assert.strictEqual(loadRegKey(path.join(dataDir, 'server_reg_key.pem')).publicKeyHex(), serverPub);
+  assert.match(serverPub, /^04[0-9a-f]{128}$/);
+});

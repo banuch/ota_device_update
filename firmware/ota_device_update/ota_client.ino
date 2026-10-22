@@ -12,8 +12,9 @@
 //    POST /ota/report  {device_id, version, status, detail, ts, sig}
 //         sig = HMAC(key, "<imei>|<version>|<status>|<ts>")
 //
-//  key = the 64-hex-char device key provisioned with "SET secret=...",
-//  used as ASCII bytes (same as the server).
+//  key = the 64-hex-char device key, received through automatic registration
+//  (register.ino) or provisioned with "SET secret=...", used as ASCII bytes
+//  (same as the server).
 //
 //  Flash safety: the image is streamed into the inactive OTA slot; the boot
 //  partition is switched only after byte count, MD5, and esp_ota_end()'s own
@@ -92,7 +93,7 @@ static String ota_getPending() {
 static bool ota_ready(uint32_t& ts) {
     if (g_cfg.secret.length() != 64) {
         g_ota.lastResult = "no_device_key";
-        DEBUG_SERIAL.println("[OTA] Device key not provisioned -- use SET secret=<64 hex>");
+        DEBUG_SERIAL.println("[OTA] Device key not provisioned -- registration pending or SET secret=<64 hex>");
         return false;
     }
     if (g_ota.imei.isEmpty()) {
@@ -300,6 +301,16 @@ void ota_run() {
             return;
         }
         ota_reportBootResult();
+    }
+
+    // No device key yet: ask the server for one (automatic registration).
+    if (g_cfg.secret.length() != 64) {
+        uint32_t wait = reg_run();
+        if (wait) {
+            ota_scheduleNext(wait);
+            g_ota.busy = false;
+            return;
+        }
     }
 
     OtaOffer offer;

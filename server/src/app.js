@@ -4,6 +4,7 @@ const fs = require('fs');
 const path = require('path');
 const { openDb } = require('./db');
 const { ReplayGuard } = require('./hmac');
+const { loadRegKey } = require('./regkey');
 const { createAuth } = require('./auth');
 const { deviceRoutes } = require('./routes/device');
 const { adminRoutes } = require('./routes/admin');
@@ -14,6 +15,7 @@ function createApp(cfg) {
   fs.mkdirSync(cfg.firmwareDir, { recursive: true });
   const store = openDb(cfg.dbFile, { clock: cfg.clock });
   const replayGuard = new ReplayGuard(cfg.tsWindowSec);
+  const regKey = loadRegKey(cfg.regKeyFile);
   const auth = createAuth({ store, cfg });
 
   const app = express();
@@ -34,7 +36,7 @@ function createApp(cfg) {
   });
 
   app.get('/health', (req, res) => res.json({ ok: true }));
-  app.use('/ota', deviceRoutes({ store, cfg, replayGuard }));
+  app.use('/ota', deviceRoutes({ store, cfg, replayGuard, regKey }));
 
   // Dashboard: session cookie -> req.user for everything below.
   app.use(auth.sessionMiddleware);
@@ -46,7 +48,7 @@ function createApp(cfg) {
   });
   app.use('/auth', authRoutes({ store, auth }));
   app.use('/api/users', auth.requireApi, userRoutes({ store, auth }));
-  app.use('/api', adminRoutes({ store, cfg, auth }));
+  app.use('/api', adminRoutes({ store, cfg, auth, regKey }));
   app.use('/api', (req, res) => res.status(404).json({ error: 'not_found' }));
   app.use('/', express.static(path.join(__dirname, '..', 'public'), {
     setHeaders: (res) => res.setHeader('Cache-Control', 'no-cache'),
@@ -58,7 +60,7 @@ function createApp(cfg) {
     res.status(500).json({ error: 'internal_error' });
   });
 
-  return { app, store, auth };
+  return { app, store, auth, regKey };
 }
 
 module.exports = { createApp };
